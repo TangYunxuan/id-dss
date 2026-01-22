@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Redirecting...</title>
+    <script>
+      // GitHub Pages SPA fallback for history mode routing.
+      // Redirect unknown paths to /?redirect=... so index.html can boot the SPA.
+      (function () {
+        var path = window.location.pathname + window.location.search + window.location.hash;
+        // If you deploy under a sub-path (e.g. /id-dss/), update this prefix.
+        var base = '/id-dss/';
+        var target = base + '?redirect=' + encodeURIComponent(path);
+        window.location.replace(target);
+      })();
+    </script>
+  </head>
+  <body></body>
+</html>
+
