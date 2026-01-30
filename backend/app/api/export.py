@@ -397,6 +397,7 @@ def _export_to_docx_bytes(export_data: Dict[str, Any]) -> bytes:
     """
     try:
         from docx import Document  # type: ignore
+        from docx.shared import Inches  # type: ignore
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -407,11 +408,32 @@ def _export_to_docx_bytes(export_data: Dict[str, Any]) -> bytes:
     session = final.get("session", {}) or {}
     doc = Document()
 
-    def add_bullet(text: str) -> None:
+    DEFAULT_BULLET_TEXT_INDENT = Inches(0.5)
+
+    def add_bullet(text: str):
         try:
-            doc.add_paragraph(text, style="List Bullet")
+            return doc.add_paragraph(text, style="List Bullet")
         except Exception:
-            doc.add_paragraph(f"- {text}")
+            return doc.add_paragraph(f"- {text}")
+
+    def add_bullet_detail(text: str, anchor_bullet_para=None) -> None:
+        """
+        Add a paragraph that visually belongs to the bullet above it.
+        Indent it to align with the bullet text (not the bullet glyph).
+        """
+        cleaned = _clean_text(text)
+        if not cleaned:
+            return
+        p = doc.add_paragraph(cleaned)
+        indent = None
+        if anchor_bullet_para is not None:
+            try:
+                indent = anchor_bullet_para.paragraph_format.left_indent
+            except Exception:
+                indent = None
+        p.paragraph_format.left_indent = indent or DEFAULT_BULLET_TEXT_INDENT
+        p.paragraph_format.space_before = 0
+        p.paragraph_format.space_after = 0
 
     doc.add_heading(_clean_text(final.get("title")), level=0)
     doc.add_paragraph(f"Exported at: {_clean_text(final.get('exported_at'))}")
@@ -446,9 +468,9 @@ def _export_to_docx_bytes(export_data: Dict[str, Any]) -> bytes:
                     continue
                 line = f"{_clean_text(item.get('objective'))} — level: {_clean_text(item.get('current_level'))}".strip(" —")
                 if line:
-                    add_bullet(line)
+                    bullet_p = add_bullet(line)
                 if item.get("suggestion"):
-                    doc.add_paragraph(_clean_text(item.get("suggestion")))
+                    add_bullet_detail(_clean_text(item.get("suggestion")), anchor_bullet_para=bullet_p if line else None)
 
     ap = final.get("activity_plan")
     if isinstance(ap, dict) and ap.get("activities"):
@@ -532,7 +554,8 @@ def _export_to_pdf_bytes(export_data: Dict[str, Any]) -> bytes:
     try:
         from reportlab.lib.pagesizes import letter  # type: ignore
         from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak  # type: ignore
-        from reportlab.lib.styles import getSampleStyleSheet  # type: ignore
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle  # type: ignore
+        from reportlab.lib.units import inch  # type: ignore
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -544,6 +567,34 @@ def _export_to_pdf_bytes(export_data: Dict[str, Any]) -> bytes:
         return _xml_escape(text).replace("\n", "<br/>")
 
     styles = getSampleStyleSheet()
+    bullet_style = ParagraphStyle(
+        "Bullet",
+        parent=styles["Normal"],
+        leftIndent=0.5 * inch,        # where bullet text starts
+        firstLineIndent=-0.25 * inch, # hang the bullet into the margin
+        spaceBefore=0,
+        spaceAfter=0,
+    )
+    bullet_detail_style = ParagraphStyle(
+        "BulletDetail",
+        parent=styles["Normal"],
+        leftIndent=0.5 * inch,  # align with bullet text
+        spaceBefore=0,
+        spaceAfter=0,
+    )
+
+    def add_bullet_pdf(text: str) -> None:
+        cleaned = _clean_text(text)
+        if not cleaned:
+            return
+        story.append(Paragraph(p(f"• {cleaned}"), bullet_style))
+
+    def add_bullet_detail_pdf(text: str) -> None:
+        cleaned = _clean_text(text)
+        if not cleaned:
+            return
+        story.append(Paragraph(p(cleaned), bullet_detail_style))
+
     story: List[Any] = []
 
     final = _build_final_design(export_data)
@@ -566,7 +617,7 @@ def _export_to_pdf_bytes(export_data: Dict[str, Any]) -> bytes:
     if session.get("learning_objectives_lines"):
         story.append(Paragraph(p("Learning Objectives"), styles["Heading1"]))
         for ln in session.get("learning_objectives_lines") or []:
-            story.append(Paragraph(p(f"- {_clean_text(ln)}"), styles["Normal"]))
+            add_bullet_pdf(_clean_text(ln))
         story.append(Spacer(1, 12))
 
     oa = final.get("objective_analysis")
@@ -585,9 +636,9 @@ def _export_to_pdf_bytes(export_data: Dict[str, Any]) -> bytes:
                     continue
                 line = f"{_clean_text(item.get('objective'))} — level: {_clean_text(item.get('current_level'))}".strip(" —")
                 if line:
-                    story.append(Paragraph(p(f"- {line}"), styles["Normal"]))
+                    add_bullet_pdf(line)
                 if item.get("suggestion"):
-                    story.append(Paragraph(p(_clean_text(item.get("suggestion"))), styles["Normal"]))
+                    add_bullet_detail_pdf(_clean_text(item.get("suggestion")))
         story.append(Spacer(1, 12))
 
     ap = final.get("activity_plan")
@@ -613,15 +664,15 @@ def _export_to_pdf_bytes(export_data: Dict[str, Any]) -> bytes:
             if isinstance(act.get("objective_alignment"), list) and act.get("objective_alignment"):
                 story.append(Paragraph(p("Aligns with objectives:"), styles["Heading3"]))
                 for o in act.get("objective_alignment"):
-                    story.append(Paragraph(p(f"- {_clean_text(o)}"), styles["Normal"]))
+                    add_bullet_pdf(_clean_text(o))
             if isinstance(act.get("materials_needed"), list) and act.get("materials_needed"):
                 story.append(Paragraph(p("Materials:"), styles["Heading3"]))
                 for m in act.get("materials_needed"):
-                    story.append(Paragraph(p(f"- {_clean_text(m)}"), styles["Normal"]))
+                    add_bullet_pdf(_clean_text(m))
             if isinstance(act.get("instructions"), list) and act.get("instructions"):
                 story.append(Paragraph(p("Instructions:"), styles["Heading3"]))
                 for ins in act.get("instructions"):
-                    story.append(Paragraph(p(f"- {_clean_text(ins)}"), styles["Normal"]))
+                    add_bullet_pdf(_clean_text(ins))
             if _clean_text(act.get("assessment_criteria")):
                 story.append(Paragraph(p("Assessment criteria:"), styles["Heading3"]))
                 story.append(Paragraph(p(_clean_text(act.get("assessment_criteria"))), styles["Normal"]))
@@ -629,7 +680,7 @@ def _export_to_pdf_bytes(export_data: Dict[str, Any]) -> bytes:
                 story.append(Paragraph(p("Adaptations:"), styles["Heading3"]))
                 for k, v in act.get("adaptations").items():
                     if _clean_text(v):
-                        story.append(Paragraph(p(f"- {_clean_text(k)}: {_clean_text(v)}"), styles["Normal"]))
+                        add_bullet_pdf(f"{_clean_text(k)}: {_clean_text(v)}")
             story.append(Spacer(1, 8))
 
     asmt = final.get("assessment_plan")
@@ -651,11 +702,11 @@ def _export_to_pdf_bytes(export_data: Dict[str, Any]) -> bytes:
             if isinstance(a.get("objective_alignment"), list) and a.get("objective_alignment"):
                 story.append(Paragraph(p("Aligns with objectives:"), styles["Heading3"]))
                 for o in a.get("objective_alignment"):
-                    story.append(Paragraph(p(f"- {_clean_text(o)}"), styles["Normal"]))
+                    add_bullet_pdf(_clean_text(o))
             if isinstance(a.get("rubric_criteria"), list) and a.get("rubric_criteria"):
                 story.append(Paragraph(p("Rubric criteria:"), styles["Heading3"]))
                 for r in a.get("rubric_criteria"):
-                    story.append(Paragraph(p(f"- {_clean_text(r)}"), styles["Normal"]))
+                    add_bullet_pdf(_clean_text(r))
             if _clean_text(a.get("feedback_strategy")):
                 story.append(Paragraph(p("Feedback strategy:"), styles["Heading3"]))
                 story.append(Paragraph(p(_clean_text(a.get("feedback_strategy"))), styles["Normal"]))
