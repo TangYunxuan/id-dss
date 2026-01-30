@@ -13,6 +13,47 @@ _openai_client = None
 _anthropic_client = None
 
 
+def _pick_gemini_model_from_list(models: List[Any], preferred: str) -> Optional[str]:
+    """
+    Pick a Gemini model name (without the `models/` prefix) that supports generateContent.
+    Prefer "flash" variants when available.
+    """
+    candidates: List[str] = []
+    for m in models or []:
+        name = getattr(m, "name", "") or ""
+        methods = getattr(m, "supported_generation_methods", None) or []
+        if "generateContent" not in methods:
+            continue
+        # list_models returns names like "models/gemini-1.5-flash"
+        if name.startswith("models/"):
+            name = name.split("/", 1)[1]
+        if name:
+            candidates.append(name)
+
+    if not candidates:
+        return None
+
+    # Exact match if possible.
+    if preferred in candidates:
+        return preferred
+
+    preferred_lower = (preferred or "").lower()
+
+    def score(n: str) -> tuple[int, int]:
+        nl = n.lower()
+        s = 0
+        if "flash" in nl:
+            s += 3
+        if "1.5" in nl:
+            s += 2
+        if preferred_lower and preferred_lower in nl:
+            s += 4
+        # Tie-breaker: shorter tends to be "canonical"
+        return (s, -len(n))
+
+    return sorted(candidates, key=score, reverse=True)[0]
+
+
 def _get_openai_client():
     """Get or create OpenAI client."""
     global _openai_client
@@ -136,15 +177,43 @@ async def _call_llm(system_prompt: str, user_prompt: str) -> str:
 
         genai.configure(api_key=settings.GEMINI_API_KEY)
 
-        # In google-generativeai, system_instruction is supported on the model.
-        model = genai.GenerativeModel(
-            model_name=settings.GEMINI_MODEL,
-            system_instruction=system_prompt,
-        )
-        response = model.generate_content(
-            user_prompt,
-            generation_config=GenerationConfig(temperature=0.7),
-        )
+        def run_with_model(model_name: str):
+            # In google-generativeai, system_instruction is supported on the model.
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                system_instruction=system_prompt,
+            )
+            return model.generate_content(
+                user_prompt,
+                generation_config=GenerationConfig(temperature=0.7),
+            )
+
+        try:
+            response = run_with_model(settings.GEMINI_MODEL)
+        except Exception as e:
+            # If the configured model is not available for this key/region/API version,
+            # try to pick a compatible model automatically.
+            msg = str(e).lower()
+            is_model_issue = (
+                "model" in msg
+                and ("not found" in msg or "not supported" in msg or "generatecontent" in msg)
+            )
+            if not is_model_issue:
+                raise
+
+            try:
+                available = list(genai.list_models())
+                fallback = _pick_gemini_model_from_list(available, settings.GEMINI_MODEL)
+            except Exception:
+                fallback = None
+
+            if not fallback or fallback == settings.GEMINI_MODEL:
+                raise ValueError(
+                    f"Gemini model '{settings.GEMINI_MODEL}' is not available for this API key. "
+                    "Set GEMINI_MODEL to an available model."
+                ) from e
+
+            response = run_with_model(fallback)
 
         # Prefer the library's .text helper, fall back safely.
         text = getattr(response, "text", None)

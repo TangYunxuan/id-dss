@@ -328,3 +328,44 @@ async def llm_status():
     }
 
 
+@router.get("/gemini/models")
+async def gemini_models():
+    """
+    List Gemini models available for the configured API key.
+    Helpful when a model name is not found / not supported.
+    """
+    if not settings.GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Gemini API key not configured. Set GEMINI_API_KEY in your environment variables.",
+        )
+
+    try:
+        import google.generativeai as genai
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"google-generativeai import failed: {str(e)}",
+        )
+
+    genai.configure(api_key=settings.GEMINI_API_KEY)
+    out = []
+    for m in list(genai.list_models()):
+        name = getattr(m, "name", "") or ""
+        if name.startswith("models/"):
+            name = name.split("/", 1)[1]
+        out.append(
+            {
+                "name": name,
+                "display_name": getattr(m, "display_name", None),
+                "supported_generation_methods": getattr(m, "supported_generation_methods", None),
+            }
+        )
+
+    return {
+        "configured_model": settings.GEMINI_MODEL,
+        "models": out,
+        "generate_content_models": [x for x in out if x.get("supported_generation_methods") and "generateContent" in x["supported_generation_methods"]],
+    }
+
+
