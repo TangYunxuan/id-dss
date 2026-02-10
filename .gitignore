@@ -13,6 +13,7 @@ venv/
 # Environment / secrets
 backend/.env
 .env
+frontend/.env*
 
 # Database
 backend/id_dss.db

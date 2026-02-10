@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive, onMounted, computed } from 'vue'
+import { ref, reactive, onMounted, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useSessionStore } from '@/stores/session'
 import { createSession, updateSession } from '@/services/api'
@@ -20,12 +20,60 @@ const form = reactive<CourseContextForm>({
   learning_objectives: '',
 })
 
+function normalizeObjectiveLine(line: string): string {
+  return (line || '')
+    .replace(/^\s*(?:[-*•]|\d+\.)\s+/, '')
+    .trim()
+}
+
+function parseObjectivesText(text: string): string[] {
+  const raw = (text || '').replace(/\r\n/g, '\n').trim()
+  if (!raw) return []
+  return raw
+    .split('\n')
+    .map(normalizeObjectiveLine)
+    .filter(Boolean)
+}
+
+function joinObjectives(lines: string[]): string {
+  return (lines || []).map(normalizeObjectiveLine).filter(Boolean).join('\n')
+}
+
+const objectivesLines = ref<string[]>([])
+const showBulkPaste = ref(false)
+const bulkObjectivesText = ref('')
+
 onMounted(() => {
   // If user navigates back with an active session, prefill the form from the store
   if (hasExistingSession.value) {
     Object.assign(form, sessionStore.courseContext)
   }
+  objectivesLines.value = parseObjectivesText(form.learning_objectives || '')
 })
+
+watch(
+  objectivesLines,
+  (lines) => {
+    form.learning_objectives = joinObjectives(lines)
+  },
+  { deep: true }
+)
+
+function addObjectiveLine() {
+  objectivesLines.value.push('')
+}
+
+function removeObjectiveLine(idx: number) {
+  objectivesLines.value.splice(idx, 1)
+}
+
+function applyBulkPaste() {
+  const lines = parseObjectivesText(bulkObjectivesText.value)
+  if (lines.length === 0) return
+  objectivesLines.value = [...objectivesLines.value, ...lines]
+  bulkObjectivesText.value = ''
+  showBulkPaste.value = false
+}
 
 const levelOptions = [
   { value: 'undergraduate', label: 'Undergraduate' },
@@ -166,13 +214,54 @@ async function handleSubmit() {
           <label for="learning_objectives" class="input-label">
             Learning Objectives
           </label>
-          <textarea
-            id="learning_objectives"
-            v-model="form.learning_objectives"
-            class="textarea-field"
-            rows="5"
-            placeholder="Enter your learning objectives, one per line...&#10;&#10;e.g.,&#10;• Students will be able to explain the fundamentals of supervised learning&#10;• Students will be able to implement a basic neural network"
-          />
+          <div class="space-y-3">
+            <div v-if="objectivesLines.length === 0" class="bg-surface-50 rounded-lg p-4 text-sm text-surface-500 italic">
+              No objectives yet. Add one below, or paste multiple at once.
+            </div>
+
+            <div v-for="(_, idx) in objectivesLines" :key="idx" class="flex items-start gap-2">
+              <div class="mt-2 w-6 text-xs text-surface-500 text-right flex-shrink-0">{{ idx + 1 }}.</div>
+              <input
+                :id="idx === 0 ? 'learning_objectives' : undefined"
+                v-model="objectivesLines[idx]"
+                type="text"
+                class="input-field"
+                placeholder="e.g., Students will be able to explain..."
+              />
+              <button
+                type="button"
+                class="btn-ghost text-sm px-3 py-2 flex-shrink-0"
+                @click="removeObjectiveLine(idx)"
+                title="Remove"
+              >
+                Remove
+              </button>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-2">
+              <button type="button" class="btn-secondary" @click="addObjectiveLine">
+                + Add objective
+              </button>
+              <button type="button" class="btn-ghost" @click="showBulkPaste = !showBulkPaste">
+                {{ showBulkPaste ? 'Hide paste box' : 'Paste multiple' }}
+              </button>
+            </div>
+
+            <div v-if="showBulkPaste" class="bg-surface-50 border border-surface-200 rounded-lg p-4">
+              <div class="text-xs text-surface-500 mb-2">Paste objectives (one per line)</div>
+              <textarea
+                v-model="bulkObjectivesText"
+                class="w-full bg-white rounded-lg p-3 text-sm text-surface-700 border border-surface-200 focus:outline-none focus:ring-2 focus:ring-brand-200 focus:border-brand-300"
+                rows="4"
+                placeholder="• Objective 1&#10;• Objective 2&#10;• Objective 3"
+              />
+              <div class="flex justify-end mt-3">
+                <button type="button" class="btn-primary" @click="applyBulkPaste">
+                  Add to list
+                </button>
+              </div>
+            </div>
+          </div>
           <p class="mt-1.5 text-sm text-surface-500">
             These will be analyzed by the AI in the next step.
           </p>

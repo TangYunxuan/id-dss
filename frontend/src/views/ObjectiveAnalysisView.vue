@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, watch, nextTick } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useSessionStore } from '@/stores/session'
 import { analyzeObjectives, getLLMStatus, createAction, updateSession } from '@/services/api'
@@ -15,21 +15,68 @@ const analysisResult = ref<ObjectiveAnalysisResponse | null>(null)
 const stepId = ref<number | null>(null)
 const recommendationId = ref<number | null>(null)
 const errorMessage = ref('')
-const objectivesDraft = ref('')
+const objectivesLines = ref<string[]>([])
 // Tracks the last objectives text successfully persisted to backend (or initial baseline on mount).
 // This is used for "dirty" detection so the Save button reflects real unsaved changes.
 const lastSavedObjectives = ref('')
 const hasSavedBaseline = ref(false)
 const successMessage = ref('')
-const objectivesTextarea = ref<HTMLTextAreaElement | null>(null)
 const isSaving = ref(false)
 
+function normalizeObjectiveLine(line: string): string {
+  return (line || '')
+    .replace(/^\s*(?:[-*•]|\d+\.)\s+/, '')
+    .trim()
+}
+
+function parseObjectivesText(text: string): string[] {
+  const raw = (text || '').replace(/\r\n/g, '\n').trim()
+  if (!raw) return []
+  return raw
+    .split('\n')
+    .map(normalizeObjectiveLine)
+    .filter(Boolean)
+}
+
+function joinObjectives(lines: string[]): string {
+  return (lines || []).map(normalizeObjectiveLine).filter(Boolean).join('\n')
+}
+
+const objectivesText = computed(() => joinObjectives(objectivesLines.value))
+
+const showBulkPaste = ref(false)
+const bulkObjectivesText = ref('')
+
+function addObjectiveLine() {
+  objectivesLines.value.push('')
+}
+
+function removeObjectiveLine(idx: number) {
+  objectivesLines.value.splice(idx, 1)
+}
+
+function applyBulkPaste() {
+  const lines = parseObjectivesText(bulkObjectivesText.value)
+  if (lines.length === 0) return
+  objectivesLines.value = [...objectivesLines.value, ...lines]
+  bulkObjectivesText.value = ''
+  showBulkPaste.value = false
+}
+
+interface ImprovedObjectiveWithStatus {
+  id: string
+  text: string
+  status: 'pending' | 'accepted' | 'rejected'
+}
+
+const improvedObjectives = ref<ImprovedObjectiveWithStatus[]>([])
+
 const hasObjectives = computed(() => {
-  return objectivesDraft.value.trim().length > 0
+  return objectivesText.value.trim().length > 0
 })
 
 const isDirty = computed(() => {
-  return (objectivesDraft.value || '') !== (lastSavedObjectives.value || '')
+  return (objectivesText.value || '') !== (lastSavedObjectives.value || '')
 })
 
 onMounted(async () => {
@@ -54,7 +101,7 @@ watch(
 
     // First hydration: establish baseline + draft from store.
     if (!hasSavedBaseline.value) {
-      objectivesDraft.value = next
+      objectivesLines.value = parseObjectivesText(next)
       lastSavedObjectives.value = next
       hasSavedBaseline.value = true
       return
@@ -62,7 +109,7 @@ watch(
 
     // If user hasn't made edits since last save, keep draft in sync when navigating back/forth.
     if (!isDirty.value) {
-      objectivesDraft.value = next
+      objectivesLines.value = parseObjectivesText(next)
     }
   },
   { immediate: true }
@@ -77,32 +124,38 @@ async function runAnalysis() {
   
   try {
     // Always keep store updated for downstream steps.
-    sessionStore.updateLearningObjectives(objectivesDraft.value)
+    sessionStore.updateLearningObjectives(objectivesText.value)
 
     // Persist to backend so refresh/navigation doesn't lose it.
     // If it fails, still allow analysis to run, but keep "dirty" state so user can retry saving.
     try {
-      await updateSession(sessionStore.sessionId, { learning_objectives: objectivesDraft.value })
-      lastSavedObjectives.value = objectivesDraft.value
+      await updateSession(sessionStore.sessionId, { learning_objectives: objectivesText.value })
+      lastSavedObjectives.value = objectivesText.value
     } catch (e) {
       console.warn('Failed to persist objectives before analysis:', e)
     }
 
     const result = await analyzeObjectives(
       sessionStore.sessionId,
-      objectivesDraft.value
+      objectivesText.value
     )
     
     stepId.value = result.step_id
     recommendationId.value = result.recommendation_id
     analysisResult.value = result.data as unknown as ObjectiveAnalysisResponse
+
+    improvedObjectives.value = (analysisResult.value.improved_objectives || []).map((t, idx) => ({
+      id: `objective-${idx}`,
+      text: stripMarkdown(t || '').trim(),
+      status: 'pending' as const,
+    }))
     
     // Store in session
     sessionStore.addDesignStep({
       id: result.step_id,
       session_id: sessionStore.sessionId,
       phase: 'objective-analysis',
-      user_input: objectivesDraft.value,
+      user_input: objectivesText.value,
       created_at: new Date().toISOString(),
     })
     
@@ -119,11 +172,6 @@ async function runAnalysis() {
   }
 }
 
-function getImprovedObjectivesText(): string {
-  if (!analysisResult.value?.improved_objectives?.length) return ''
-  return analysisResult.value.improved_objectives.join('\n')
-}
-
 async function copyText(text: string, successText: string) {
   const cleaned = stripMarkdown(text)
   try {
@@ -135,8 +183,78 @@ async function copyText(text: string, successText: string) {
   }
 }
 
+function acceptedImprovedObjectives(): string[] {
+  return improvedObjectives.value
+    .filter((o) => o.status === 'accepted')
+    .map((o) => stripMarkdown(o.text || '').trim())
+    .filter(Boolean)
+}
+
+async function recordObjectiveAction(id: string, actionType: 'accept' | 'reject', payload?: Record<string, unknown>) {
+  if (!stepId.value) return
+  try {
+    await createAction({
+      step_id: stepId.value,
+      recommendation_id: recommendationId.value ?? undefined,
+      action_type: actionType,
+      edited_content: payload ? JSON.stringify(payload) : undefined,
+      comment: id,
+    })
+  } catch (e) {
+    console.warn('Failed to record objective action:', e)
+  }
+}
+
+async function acceptImprovedObjective(id: string) {
+  const item = improvedObjectives.value.find((x) => x.id === id)
+  if (!item) return
+  item.status = 'accepted'
+  await recordObjectiveAction(id, 'accept', { id, text: item.text })
+}
+
+async function rejectImprovedObjective(id: string) {
+  const item = improvedObjectives.value.find((x) => x.id === id)
+  if (!item) return
+  item.status = 'rejected'
+  await recordObjectiveAction(id, 'reject')
+}
+
+async function applyAcceptedObjectivesReplace() {
+  const accepted = acceptedImprovedObjectives()
+  if (accepted.length === 0) {
+    successMessage.value = 'No accepted objectives yet.'
+    return
+  }
+  const updated = accepted.join('\n')
+  successMessage.value = 'Applied accepted objectives. You can edit further and re-run analysis.'
+  await persistObjectives(updated, 'Replaced objectives with accepted improved objectives')
+}
+
+async function appendAcceptedObjectives() {
+  const accepted = acceptedImprovedObjectives()
+  if (accepted.length === 0) {
+    successMessage.value = 'No accepted objectives yet.'
+    return
+  }
+  const base = objectivesText.value.trim()
+  const block = accepted.join('\n')
+  const updated = base ? `${base}\n\n${block}` : block
+  successMessage.value = 'Appended accepted objectives below your existing objectives.'
+  await persistObjectives(updated, 'Inserted accepted improved objectives below existing objectives')
+}
+
+async function copyAcceptedObjectives() {
+  const accepted = acceptedImprovedObjectives()
+  if (accepted.length === 0) {
+    successMessage.value = 'No accepted objectives yet.'
+    return
+  }
+  await copyText(accepted.join('\n'), 'Copied accepted objectives to clipboard (cleaned markdown).')
+}
+
 async function persistObjectives(updated: string, actionComment: string) {
   sessionStore.updateLearningObjectives(updated)
+  objectivesLines.value = parseObjectivesText(updated)
   if (sessionStore.sessionId) {
     // Don't swallow save errors here — callers (Save button, replace/insert helpers) need to know.
     const session = await updateSession(sessionStore.sessionId, { learning_objectives: updated })
@@ -163,7 +281,7 @@ async function saveObjectives() {
   errorMessage.value = ''
   successMessage.value = ''
   try {
-    const updated = objectivesDraft.value
+    const updated = objectivesText.value
     await persistObjectives(updated, 'Saved objectives edits')
     successMessage.value = 'Saved.'
   } catch (e) {
@@ -172,41 +290,6 @@ async function saveObjectives() {
   } finally {
     isSaving.value = false
   }
-}
-
-async function insertImprovedObjectives() {
-  const improvedRaw = getImprovedObjectivesText()
-  if (!improvedRaw) return
-
-  const improved = stripMarkdown(improvedRaw)
-  const base = objectivesDraft.value.trim()
-  const updated = base ? `${base}\n\n${improved}` : improved
-
-  objectivesDraft.value = updated
-  successMessage.value = 'Inserted improved objectives below your original text.'
-  await persistObjectives(updated, 'Inserted suggested improved objectives (cleaned markdown)')
-  await nextTick()
-  objectivesTextarea.value?.focus()
-}
-
-async function replaceWithImprovedObjectives() {
-  const improvedRaw = getImprovedObjectivesText()
-  if (!improvedRaw) return
-
-  const updated = stripMarkdown(improvedRaw)
-
-  objectivesDraft.value = updated
-  successMessage.value = 'Applied improved objectives. You can edit further and re-run analysis.'
-  await persistObjectives(updated, 'Replaced objectives with suggested improved objectives (cleaned markdown)')
-
-  await nextTick()
-  objectivesTextarea.value?.focus()
-}
-
-async function copyImprovedObjectives() {
-  const improvedRaw = getImprovedObjectivesText()
-  if (!improvedRaw) return
-  await copyText(improvedRaw, 'Copied improved objectives to clipboard (cleaned markdown).')
 }
 
 function proceedToActivities() {
@@ -269,13 +352,53 @@ function proceedToActivities() {
             <span>{{ isSaving ? 'Saving...' : 'Save' }}</span>
           </button>
         </div>
-        <textarea
-          v-model="objectivesDraft"
-          ref="objectivesTextarea"
-          rows="6"
-          class="w-full bg-surface-50 rounded-lg p-4 text-sm text-surface-700 border border-surface-200 focus:outline-none focus:ring-2 focus:ring-brand-200 focus:border-brand-300"
-          placeholder="Paste or type your learning objectives here (one per line)."
-        />
+        <div class="space-y-3">
+          <div v-if="objectivesLines.length === 0" class="bg-surface-50 rounded-lg p-4 text-sm text-surface-500 italic">
+            No objectives yet. Add one below, or paste multiple at once.
+          </div>
+
+          <div v-for="(_, idx) in objectivesLines" :key="idx" class="flex items-start gap-2">
+            <div class="mt-2 w-6 text-xs text-surface-500 text-right flex-shrink-0">{{ idx + 1 }}.</div>
+            <input
+              v-model="objectivesLines[idx]"
+              type="text"
+              class="w-full bg-surface-50 rounded-lg px-3 py-2 text-sm text-surface-700 border border-surface-200 focus:outline-none focus:ring-2 focus:ring-brand-200 focus:border-brand-300"
+              placeholder="e.g., Students will be able to explain..."
+            />
+            <button
+              type="button"
+              class="btn-ghost text-sm px-3 py-2 flex-shrink-0"
+              @click="removeObjectiveLine(idx)"
+              title="Remove"
+            >
+              Remove
+            </button>
+          </div>
+
+          <div class="flex flex-wrap items-center gap-2">
+            <button type="button" class="btn-secondary" @click="addObjectiveLine">
+              + Add objective
+            </button>
+            <button type="button" class="btn-ghost" @click="showBulkPaste = !showBulkPaste">
+              {{ showBulkPaste ? 'Hide paste box' : 'Paste multiple' }}
+            </button>
+          </div>
+
+          <div v-if="showBulkPaste" class="bg-surface-50 border border-surface-200 rounded-lg p-4">
+            <div class="text-xs text-surface-500 mb-2">Paste objectives (one per line)</div>
+            <textarea
+              v-model="bulkObjectivesText"
+              class="w-full bg-white rounded-lg p-3 text-sm text-surface-700 border border-surface-200 focus:outline-none focus:ring-2 focus:ring-brand-200 focus:border-brand-300"
+              rows="4"
+              placeholder="• Objective 1&#10;• Objective 2&#10;• Objective 3"
+            />
+            <div class="flex justify-end mt-3">
+              <button type="button" class="btn-primary" @click="applyBulkPaste">
+                Add to list
+              </button>
+            </div>
+          </div>
+        </div>
         <p class="text-xs text-surface-500 mt-2">
           Tip: after you get “Suggested Improvements”, you can apply them back into this box and re-run analysis.
         </p>
@@ -359,40 +482,63 @@ function proceedToActivities() {
         </div>
 
         <!-- Improved objectives -->
-        <div v-if="analysisResult.improved_objectives?.length">
+        <div v-if="improvedObjectives.length">
           <div class="flex items-center justify-between gap-4 mb-3">
             <div class="text-sm font-medium text-surface-700">Suggested Improvements</div>
             <div class="flex items-center gap-2">
-              <button class="btn-secondary" @click="copyImprovedObjectives">
-                Copy
+              <button class="btn-secondary" @click="copyAcceptedObjectives">
+                Copy accepted
               </button>
-              <button class="btn-secondary" @click="insertImprovedObjectives">
-                Insert below
+              <button class="btn-secondary" @click="appendAcceptedObjectives">
+                Insert accepted
               </button>
-              <button class="btn-primary" @click="replaceWithImprovedObjectives">
-                Replace (clean)
+              <button class="btn-primary" @click="applyAcceptedObjectivesReplace">
+                Apply accepted
               </button>
             </div>
           </div>
           <ul class="space-y-2">
             <li 
-              v-for="(objective, index) in analysisResult.improved_objectives" 
-              :key="index"
-              class="flex items-start gap-3 p-3 bg-emerald-50 border border-emerald-200 rounded-lg"
+              v-for="(objective, index) in improvedObjectives" 
+              :key="objective.id"
+              class="flex items-start gap-3 p-3 rounded-lg border"
+              :class="{
+                'bg-emerald-50 border-emerald-200': objective.status === 'accepted',
+                'bg-red-50 border-red-200 opacity-70': objective.status === 'rejected',
+                'bg-surface-50 border-surface-200': objective.status === 'pending',
+              }"
             >
               <span class="w-6 h-6 rounded-full bg-emerald-200 text-emerald-700 flex items-center justify-center flex-shrink-0 text-xs font-medium">
                 {{ index + 1 }}
               </span>
               <div class="flex-1 min-w-0">
-                <span class="text-sm text-emerald-800">{{ objective }}</span>
+                <span class="text-sm text-surface-800">{{ objective.text }}</span>
               </div>
-              <button
-                class="btn-ghost text-sm px-3 py-1.5 flex-shrink-0"
-                @click="copyText(objective, 'Copied this suggestion (cleaned markdown).')"
-                title="Copy this suggestion"
-              >
-                Copy
-              </button>
+              <div class="flex items-center gap-2 flex-shrink-0">
+                <button
+                  class="btn-success text-sm px-3 py-1.5"
+                  :disabled="objective.status === 'accepted'"
+                  :class="{ 'opacity-50 cursor-not-allowed': objective.status === 'accepted' }"
+                  @click="acceptImprovedObjective(objective.id)"
+                >
+                  Accept
+                </button>
+                <button
+                  class="btn-danger text-sm px-3 py-1.5"
+                  :disabled="objective.status === 'rejected'"
+                  :class="{ 'opacity-50 cursor-not-allowed': objective.status === 'rejected' }"
+                  @click="rejectImprovedObjective(objective.id)"
+                >
+                  Reject
+                </button>
+                <button
+                  class="btn-ghost text-sm px-3 py-1.5"
+                  @click="copyText(objective.text, 'Copied this suggestion (cleaned markdown).')"
+                  title="Copy this suggestion"
+                >
+                  Copy
+                </button>
+              </div>
             </li>
           </ul>
         </div>
